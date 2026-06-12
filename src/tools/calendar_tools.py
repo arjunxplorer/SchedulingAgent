@@ -1,6 +1,7 @@
-from datetime import datetime
+from datetime import datetime, timedelta
 from typing import List, Dict, Any
 import json
+import threading
 import pytz
 import os
 from dateutil.parser import isoparse
@@ -10,7 +11,6 @@ from src.models import CalendarModel, CalendarEvent, TaskListModel, TaskModel
 
 # Agents and tools
 from langchain.tools import tool
-# from smolagents import tool
 
 # Google API client libraries
 from google.oauth2.credentials import Credentials
@@ -28,51 +28,152 @@ SCOPES = [
 # The port that matches your Google Cloud Console configuration
 OAUTH_PORT = 8080
 
-creds = None
+# Lazy-initialized service singletons (thread-safe)
+_calendar_service = None
+_tasks_service = None
+_service_lock = threading.Lock()
 
-# Check for existing token
-if os.path.exists("token.json"):
-    try:
-        creds = Credentials.from_authorized_user_info(
-            json.loads(open("token.json").read()), SCOPES
-        )
-    except Exception as e:
-        print(f"Error loading existing token: {e}")
-        if os.path.exists("token.json"):
-            os.remove("token.json")
+# Per-thread web context flag — safe under concurrent requests
+_thread_context = threading.local()
 
-# If there are no valid credentials, authenticate
-if not creds or not creds.valid:
+
+def _get_web_context() -> bool:
+    return getattr(_thread_context, "web_context", False)
+
+
+def _set_web_context(value: bool):
+    _thread_context.web_context = value
+
+
+def get_calendar_service():
+    """Get or create the Google Calendar API service (thread-safe lazy singleton)."""
+    global _calendar_service
+    if _calendar_service is not None:
+        return _calendar_service
+    with _service_lock:
+        if _calendar_service is not None:
+            return _calendar_service
+        creds = _authenticate()
+        _calendar_service = build("calendar", "v3", credentials=creds)
+        return _calendar_service
+
+
+def get_tasks_service():
+    """Get or create the Google Tasks API service (thread-safe lazy singleton)."""
+    global _tasks_service
+    if _tasks_service is not None:
+        return _tasks_service
+    with _service_lock:
+        if _tasks_service is not None:
+            return _tasks_service
+        creds = _authenticate()
+        _tasks_service = build("tasks", "v1", credentials=creds)
+        return _tasks_service
+
+
+def _authenticate():
+    """Run OAuth flow and return valid credentials.
+
+    Supports two modes:
+    1. Saved token: token.json exists from a previous login
+    2. Client secrets in env: GOOGLE_CLIENT_ID + GOOGLE_CLIENT_SECRET in .env
+
+    When called from the web API layer (_get_web_context()), does NOT fall through to
+    run_local_server() — instead raises FileNotFoundError so the API can return
+    a proper 401. For the web UI, use /auth/login instead (browser-based OAuth).
+    """
+    creds = None
+
+    # Check for existing token
+    if os.path.exists("token.json"):
+        try:
+            creds = Credentials.from_authorized_user_info(
+                json.loads(open("token.json").read()), SCOPES
+            )
+        except Exception as e:
+            print(f"Error loading existing token: {e}")
+            if os.path.exists("token.json"):
+                os.remove("token.json")
+
+    # Try to refresh expired token
     if creds and creds.expired and creds.refresh_token:
         try:
             creds.refresh(Request())
+            _save_token(creds)
         except Exception as e:
             print(f"Error refreshing token: {e}")
             creds = None
 
-    if not creds:
-        try:
-            print(f"Starting OAuth flow on port {OAUTH_PORT}...")
-            flow = InstalledAppFlow.from_client_secrets_file("credentials.json", SCOPES)
-            creds = flow.run_local_server(
-                port=OAUTH_PORT,
-                success_message="Authentication successful! You can close this window.",
-                open_browser=True
+    # If still no valid creds, try env-based client secrets
+    if not creds or not creds.valid:
+        if _get_web_context():
+            raise FileNotFoundError(
+                "No valid Google credentials. Please authenticate via the web UI (/auth/login)."
             )
 
-            # Save credentials for next run
-            with open("token.json", "w") as token:
-                token.write(creds.to_json())
-        except Exception as e:
-            print(f"Error during OAuth flow: {e}")
-            print("Please make sure you have added http://localhost:8080/ to your authorized redirect URIs in the Google Cloud Console")
-            raise
+        client_id = os.environ.get("GOOGLE_CLIENT_ID")
+        client_secret = os.environ.get("GOOGLE_CLIENT_SECRET")
 
-print("Authentication successful!")
+        if client_id and client_secret:
+            creds = _oauth_from_env(client_id, client_secret)
+        elif os.path.exists("credentials.json"):
+            # Fallback: legacy credentials.json file
+            creds = _oauth_from_file("credentials.json")
+        else:
+            raise FileNotFoundError(
+                "No Google credentials found. Either:\n"
+                "  1. Set GOOGLE_CLIENT_ID and GOOGLE_CLIENT_SECRET in .env, or\n"
+                "  2. Place credentials.json in the project root, or\n"
+                "  3. Use the web UI to authenticate via /auth/login"
+            )
 
-# Build service clients
-calendar_service = build("calendar", "v3", credentials=creds)
-tasks_service = build("tasks", "v1", credentials=creds)
+    print("Authentication successful!")
+    return creds
+
+
+def _save_token(creds):
+    """Save credentials to token.json."""
+    with open("token.json", "w") as f:
+        f.write(creds.to_json())
+
+
+def _oauth_from_env(client_id: str, client_secret: str):
+    """Run OAuth flow using client ID/secret from environment variables."""
+    redirect_uri = f"http://localhost:{OAUTH_PORT}/"
+    client_config = {
+        "web": {
+            "client_id": client_id,
+            "client_secret": client_secret,
+            "auth_uri": "https://accounts.google.com/o/oauth2/auth",
+            "token_uri": "https://oauth2.googleapis.com/token",
+            "redirect_uris": [redirect_uri],
+        }
+    }
+
+    print(f"Starting OAuth flow on port {OAUTH_PORT}...")
+    flow = InstalledAppFlow.from_client_config(client_config, SCOPES, redirect_uri=redirect_uri)
+    creds = flow.run_local_server(
+        port=OAUTH_PORT,
+        success_message="Authentication successful! You can close this window.",
+        open_browser=True,
+    )
+    _save_token(creds)
+    return creds
+
+
+def _oauth_from_file(path: str):
+    """Run OAuth flow using a credentials.json file."""
+    redirect_uri = f"http://localhost:{OAUTH_PORT}/"
+    print(f"Starting OAuth flow on port {OAUTH_PORT}...")
+    flow = InstalledAppFlow.from_client_secrets_file(path, SCOPES, redirect_uri=redirect_uri)
+    creds = flow.run_local_server(
+        port=OAUTH_PORT,
+        success_message="Authentication successful! You can close this window.",
+        open_browser=True,
+    )
+    _save_token(creds)
+    return creds
+
 
 @tool
 def create_calendar_events(calendar_events:list[dict[str, str]]):
@@ -110,9 +211,19 @@ def check_time_conflict(
     Returns:
         tuple[bool, list[dict]]: (has_conflict, conflicting_events)
     """
-    # Convert times to datetime objects
+    calendar_service = get_calendar_service()
+
+    # Ensure date is timezone-aware for Google Calendar API
+    if date.tzinfo is None:
+        date = timezone.localize(date)
+
+    # Convert times to timezone-aware datetime objects
     new_start = isoparse(start_time)
     new_end = isoparse(end_time)
+    if new_start.tzinfo is None:
+        new_start = timezone.localize(new_start)
+    if new_end.tzinfo is None:
+        new_end = timezone.localize(new_end)
 
     # Get all events for the day
     day_events = calendar_service.events().list(
@@ -182,6 +293,12 @@ def find_and_delete_event(
         tuple[bool, str, list[dict]]: (success, message, remaining_events)
     """
     try:
+        calendar_service = get_calendar_service()
+
+        # Ensure date is timezone-aware for Google Calendar API
+        if date.tzinfo is None:
+            date = timezone.localize(date)
+
         # Get all events for the day
         day_events = calendar_service.events().list(
             calendarId=calendar_id,
@@ -233,6 +350,8 @@ def create_calendar_event(
         start_time (str): Start time in ISO format.
         end_time (str): End time in ISO format.
     """
+    calendar_service = get_calendar_service()
+
     # Check if this is a removal request
     if summary.lower().startswith(("remove", "delete", "cancel")):
         # Extract the event name from the summary
@@ -308,11 +427,26 @@ def create_calendar_event(
             conflict_msg = ["⚠️ Time conflict detected! The following events overlap with your requested time:"]
             for ev in conflicting_events:
                 conflict_msg.append(f" • {ev['start']} - {ev['end']} — {ev['summary']}")
-            conflict_msg.append("\nPlease choose a different time.")
+
+            # Suggest alternative times
+            suggestions = suggest_alternative_times.invoke({
+                "date": event_date.strftime("%Y-%m-%d"),
+                "start_time": start_time.split("T")[1][:5] if "T" in start_time else start_time,
+                "end_time": end_time.split("T")[1][:5] if "T" in end_time else end_time,
+            })
+
+            if suggestions:
+                conflict_msg.append("\nSuggested alternatives:")
+                for s in suggestions:
+                    conflict_msg.append(f"  • {s['display']}")
+            else:
+                conflict_msg.append("\nNo free slots found for this duration today.")
+
             return {
                 "error": True,
                 "message": "\n".join(conflict_msg),
-                "conflicting_events": conflicting_events
+                "conflicting_events": conflicting_events,
+                "suggestions": suggestions,
             }
 
         # Get current day's events for display
@@ -324,19 +458,40 @@ def create_calendar_event(
             orderBy="startTime"
         ).execute().get("items", [])
 
-        # Insert new event
-        created_event = (
-            calendar_service.events()
-            .insert(calendarId=calendar_id, body=event_body)
-            .execute()
-        )
+        # Insert new event (retry on SSL errors with fresh connection)
+        for attempt in range(3):
+            try:
+                created_event = (
+                    calendar_service.events()
+                    .insert(calendarId=calendar_id, body=event_body)
+                    .execute()
+                )
+                break
+            except Exception as e:
+                if "SSL" in str(e) or "WRONG_VERSION_NUMBER" in str(e):
+                    print(f"SSL error on attempt {attempt+1}, retrying with fresh connection...")
+                    # Force a fresh HTTP connection
+                    import httplib2
+                    calendar_service._http = httplib2.Http()
+                    if attempt == 2:
+                        raise
+                else:
+                    raise
 
         print(f"Event created: {created_event['htmlLink']}")
 
         # Add the new event to the list for display
         day_events.append(created_event)
-        # Sort events by start time
-        day_events.sort(key=lambda x: isoparse(x["start"].get("dateTime", x["start"].get("date"))))
+        # Sort events by start time (skip events without valid start)
+        def _sort_key(x):
+            raw = x.get("start", {}).get("dateTime") or x.get("start", {}).get("date")
+            if not raw:
+                return datetime.min.replace(tzinfo=timezone)
+            dt = isoparse(raw)
+            if dt.tzinfo is None:
+                dt = timezone.localize(dt)
+            return dt
+        day_events.sort(key=_sort_key)
 
         # Build response string
         resp_lines = [f"✅ Added {created_event.get('summary','(no title)')}."]
@@ -353,6 +508,7 @@ def create_calendar_event(
 
 def list_calendars() -> List[Dict[str, Any]]:
     """List all calendars."""
+    calendar_service = get_calendar_service()
     calendars_result = calendar_service.calendarList().list().execute()
     calendars = [
         CalendarModel(id=calendar["id"], summary=calendar["summary"])
@@ -361,13 +517,17 @@ def list_calendars() -> List[Dict[str, Any]]:
     return calendars
 
 
-def get_calendar_events(id:str=os.getenv("CALENDAR_ID"), date:str=None) -> List[CalendarEvent]:
+def get_calendar_events(id=None, date=None) -> List[CalendarEvent]:
     """Fetch calendar events for the specified date (today by default).
 
     Args:
-        id (str): Calendar ID. Defaults to 'CALENDAR_ID' found in the environment variables.
+        id (str): Calendar ID. Defaults to 'CALENDAR_ID' env var or 'primary'.
         date (datetime): Date for which to fetch events. Defaults to today.
     """
+    if id is None:
+        id = os.getenv("CALENDAR_ID", "primary")
+    calendar_service = get_calendar_service()
+
     if not date:
         date = datetime.now(timezone)
 
@@ -402,6 +562,7 @@ def get_calendar_events(id:str=os.getenv("CALENDAR_ID"), date:str=None) -> List[
 
 def list_tasks() -> List[Dict[str, Any]]:
     """List all task lists."""
+    tasks_service = get_tasks_service()
     tasklists_result = tasks_service.tasklists().list().execute()
     tasklists = [
         TaskListModel(title=task_list["title"], id=task_list["id"])
@@ -416,6 +577,7 @@ def get_tasks(task_list_id:str="@default") -> List[Dict[str, Any]]:
     Args:
         task_list_id (str): The id of the task list to get the tasks from.
     """
+    tasks_service = get_tasks_service()
 
     # Get incomplete tasks
     tasks_result = (
@@ -446,6 +608,8 @@ def get_tasks(task_list_id:str="@default") -> List[Dict[str, Any]]:
 def test_calendar_access():
     """Test function to verify calendar access and list available calendars."""
     try:
+        calendar_service = get_calendar_service()
+
         # List all calendars
         calendar_list = calendar_service.calendarList().list().execute()
         print("\nAvailable calendars:")
@@ -469,6 +633,8 @@ def clear_calendar_events(calendar_id: str = "primary") -> bool:
         calendar_id (str): The calendar ID to clear. Defaults to primary calendar.
     """
     try:
+        calendar_service = get_calendar_service()
+
         # Get all events
         events_result = calendar_service.events().list(calendarId=calendar_id).execute()
         events = events_result.get('items', [])
@@ -539,6 +705,302 @@ def format_schedule_for_calendar(schedule_text: str) -> List[Dict[str, str]]:
             })
 
     return events
+
+@tool
+def find_free_slots(date: str, duration_minutes: int = 60) -> list[dict]:
+    """Find available time slots on a given date that fit a requested duration.
+
+    Args:
+        date (str): Date in YYYY-MM-DD format
+        duration_minutes (int): Required slot duration in minutes (default 60)
+    """
+    calendar_service = get_calendar_service()
+    calendar_id = os.getenv("CALENDAR_ID", "primary")
+
+    day = datetime.fromisoformat(date)
+    day = timezone.localize(day)
+
+    # Get all events for the day
+    day_events = calendar_service.events().list(
+        calendarId=calendar_id,
+        timeMin=day.replace(hour=0, minute=0, second=0).isoformat(),
+        timeMax=day.replace(hour=23, minute=59, second=59).isoformat(),
+        singleEvents=True,
+        orderBy="startTime"
+    ).execute().get("items", [])
+
+    # Build list of busy intervals (skip all-day events, strip tzinfo for naive comparison)
+    busy = []
+    for ev in day_events:
+        if "dateTime" in ev["start"]:
+            ev_start = isoparse(ev["start"]["dateTime"])
+            ev_end = isoparse(ev["end"]["dateTime"])
+            # Strip timezone for consistent naive comparison
+            if ev_start.tzinfo is not None:
+                ev_start = ev_start.replace(tzinfo=None)
+            if ev_end.tzinfo is not None:
+                ev_end = ev_end.replace(tzinfo=None)
+            busy.append({"start": ev_start, "end": ev_end})
+
+    # Sort by start time
+    busy.sort(key=lambda x: x["start"])
+
+    # Find gaps between events (8am - 10pm window)
+    # Use naive datetimes to match isoparse() output (naive from ISO strings)
+    day_naive = day.replace(tzinfo=None)
+    day_start = day_naive.replace(hour=8, minute=0, second=0)
+    day_end = day_naive.replace(hour=22, minute=0, second=0)
+    required = timedelta(minutes=duration_minutes)
+
+    free_slots = []
+    cursor = day_start
+
+    for b in busy:
+        if b["start"] - cursor >= required:
+            free_slots.append({
+                "start": cursor.strftime("%H:%M"),
+                "end": b["start"].strftime("%H:%M"),
+                "duration_minutes": int((b["start"] - cursor).total_seconds() / 60),
+            })
+        cursor = max(cursor, b["end"])
+
+    # Check gap after last event
+    if day_end - cursor >= required:
+        free_slots.append({
+            "start": cursor.strftime("%H:%M"),
+            "end": day_end.strftime("%H:%M"),
+            "duration_minutes": int((day_end - cursor).total_seconds() / 60),
+        })
+
+    return free_slots
+
+
+@tool
+def create_task(title: str, notes: str = "", due: str = "") -> dict:
+    """Create a new task in Google Tasks.
+
+    Args:
+        title (str): Task title
+        notes (str): Optional task notes
+        due (str): Optional due date in ISO format (YYYY-MM-DD or full ISO datetime)
+    """
+    tasks_service = get_tasks_service()
+
+    task_body = {"title": title}
+    if notes:
+        task_body["notes"] = notes
+    if due:
+        # Google Tasks expects RFC 3339 format for due date
+        if "T" not in due:
+            due_dt = datetime.fromisoformat(due)
+            due_dt = timezone.localize(due_dt)
+            task_body["due"] = due_dt.isoformat()
+        else:
+            task_body["due"] = due
+
+    result = tasks_service.tasks().insert(
+        tasklist="@default",
+        body=task_body
+    ).execute()
+
+    return {
+        "success": True,
+        "message": f"✅ Task created: {result.get('title')}",
+        "task_id": result.get("id"),
+    }
+
+
+@tool
+def delete_task(title: str) -> dict:
+    """Delete a task from Google Tasks by title.
+
+    Args:
+        title (str): Title (or partial title) of the task to delete
+    """
+    tasks_service = get_tasks_service()
+
+    # List all tasks
+    result = tasks_service.tasks().list(
+        tasklist="@default",
+        showCompleted=True,
+        maxResults=100,
+    ).execute()
+
+    tasks = result.get("items", [])
+    title_lower = title.lower().strip()
+
+    # Find matching tasks
+    deleted = []
+    for task in tasks:
+        task_title = task.get("title", "").lower()
+        if title_lower in task_title or task_title in title_lower:
+            tasks_service.tasks().delete(
+                tasklist="@default",
+                task=task["id"],
+            ).execute()
+            deleted.append(task.get("title", "Unknown"))
+
+    if deleted:
+        return {
+            "success": True,
+            "message": f"✅ Deleted task: {', '.join(deleted)}",
+        }
+    else:
+        return {
+            "success": False,
+            "message": f"❌ No task found matching '{title}'",
+        }
+
+
+@tool
+def suggest_alternative_times(date: str, start_time: str, end_time: str, num_suggestions: int = 3) -> list[dict]:
+    """Suggest alternative time slots when a conflict is detected.
+
+    Args:
+        date (str): Date in YYYY-MM-DD format
+        start_time (str): Original requested start time in HH:MM format
+        end_time (str): Original requested end time in HH:MM format
+        num_suggestions (int): Number of alternatives to suggest (default 3)
+    """
+    # Calculate duration from the requested times
+    start_dt = datetime.strptime(f"{date} {start_time}", "%Y-%m-%d %H:%M")
+    end_dt = datetime.strptime(f"{date} {end_time}", "%Y-%m-%d %H:%M")
+    duration = int((end_dt - start_dt).total_seconds() / 60)
+
+    # Find all free slots that fit the duration
+    free_slots = find_free_slots.invoke({
+        "date": date,
+        "duration_minutes": duration,
+    })
+
+    if not free_slots:
+        return []
+
+    # Sort by proximity to the originally requested time
+    requested_minutes = start_dt.hour * 60 + start_dt.minute
+
+    def distance(slot):
+        slot_minutes = int(slot["start"].split(":")[0]) * 60 + int(slot["start"].split(":")[1])
+        return abs(slot_minutes - requested_minutes)
+
+    free_slots.sort(key=distance)
+
+    # Return the closest N suggestions with formatted times
+    suggestions = []
+    for slot in free_slots[:num_suggestions]:
+        s_hour, s_min = slot["start"].split(":")
+        e_hour, e_min = slot["end"].split(":")
+        s_dt = datetime.strptime(f"{date} {slot['start']}", "%Y-%m-%d %H:%M")
+        e_dt = datetime.strptime(f"{date} {slot['end']}", "%Y-%m-%d %H:%M")
+        # Cap the end time to the original duration
+        capped_end = s_dt + timedelta(minutes=duration)
+        if capped_end > e_dt:
+            continue
+        suggestions.append({
+            "start_time": slot["start"],
+            "end_time": capped_end.strftime("%H:%M"),
+            "display": f"{s_dt.strftime('%I:%M %p').lstrip('0')} - {capped_end.strftime('%I:%M %p').lstrip('0')}",
+        })
+
+    return suggestions
+
+
+@tool
+def update_calendar_event(event_id: str, summary: str = "", start_time: str = "", end_time: str = "") -> dict:
+    """Update an existing calendar event. Only provided fields are changed.
+
+    Args:
+        event_id (str): The Google Calendar event ID
+        summary (str): New summary (empty = don't change)
+        start_time (str): New start time in ISO format (empty = don't change)
+        end_time (str): New end time in ISO format (empty = don't change)
+    """
+    calendar_service = get_calendar_service()
+    calendar_id = os.getenv("CALENDAR_ID", "primary")
+
+    # Fetch existing event
+    event = calendar_service.events().get(
+        calendarId=calendar_id, eventId=event_id
+    ).execute()
+
+    if summary:
+        event["summary"] = summary
+    if start_time:
+        event["start"] = {"dateTime": start_time, "timeZone": str(timezone)}
+    if end_time:
+        event["end"] = {"dateTime": end_time, "timeZone": str(timezone)}
+
+    updated = calendar_service.events().update(
+        calendarId=calendar_id,
+        eventId=event_id,
+        body=event,
+    ).execute()
+
+    return {
+        "success": True,
+        "message": f"✅ Updated event: {updated.get('summary')}",
+        "htmlLink": updated.get("htmlLink"),
+    }
+
+
+@tool
+def search_events(query: str, date_range: str = "today") -> list[dict]:
+    """Search for events matching a query within a date range.
+
+    Args:
+        query (str): Text to search for in event summaries
+        date_range (str): 'today', 'tomorrow', 'this_week', 'next_week', or a specific YYYY-MM-DD date
+    """
+    calendar_service = get_calendar_service()
+    calendar_id = os.getenv("CALENDAR_ID", "primary")
+
+    now = datetime.now(timezone)
+
+    # Parse date range
+    if date_range == "today":
+        range_start = now.replace(hour=0, minute=0, second=0)
+        range_end = now.replace(hour=23, minute=59, second=59)
+    elif date_range == "tomorrow":
+        tomorrow = now + timedelta(days=1)
+        range_start = tomorrow.replace(hour=0, minute=0, second=0)
+        range_end = tomorrow.replace(hour=23, minute=59, second=59)
+    elif date_range == "this_week":
+        # Start of current week (Monday)
+        days_since_monday = now.weekday()
+        range_start = (now - timedelta(days=days_since_monday)).replace(hour=0, minute=0, second=0)
+        range_end = (range_start + timedelta(days=6)).replace(hour=23, minute=59, second=59)
+    elif date_range == "next_week":
+        days_since_monday = now.weekday()
+        next_monday = now + timedelta(days=7 - days_since_monday)
+        range_start = next_monday.replace(hour=0, minute=0, second=0)
+        range_end = (range_start + timedelta(days=6)).replace(hour=23, minute=59, second=59)
+    else:
+        # Specific date
+        target = datetime.fromisoformat(date_range)
+        target = timezone.localize(target)
+        range_start = target.replace(hour=0, minute=0, second=0)
+        range_end = target.replace(hour=23, minute=59, second=59)
+
+    events_result = calendar_service.events().list(
+        calendarId=calendar_id,
+        timeMin=range_start.isoformat(),
+        timeMax=range_end.isoformat(),
+        singleEvents=True,
+        orderBy="startTime",
+        q=query,
+    ).execute()
+
+    events = []
+    for ev in events_result.get("items", []):
+        events.append({
+            "id": ev["id"],
+            "summary": ev.get("summary", "(no title)"),
+            "start": ev["start"].get("dateTime", ev["start"].get("date")),
+            "end": ev["end"].get("dateTime", ev["end"].get("date")),
+        })
+
+    return events
+
 
 # Add test call after authentication
 if __name__ == "__main__":

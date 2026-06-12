@@ -3,6 +3,31 @@ from src.utils import parse_iso_date
 from typing import Any
 
 
+class UserIntent(BaseModel):
+    """Structured interpretation of a user's scheduling request."""
+
+    action: str = Field(
+        description="One of: create_event, query, modify, delete, create_task, add_task_to_calendar, plan_schedule"
+    )
+    title: str | None = Field(None, description="Event or task name")
+    date: str | None = Field(None, description="Date in YYYY-MM-DD format")
+    start_time: str | None = Field(None, description="Start time in HH:MM 24-hour format")
+    end_time: str | None = Field(None, description="End time in HH:MM 24-hour format")
+    recurrence: str | None = Field(
+        None,
+        description="Recurrence rule: 'daily', 'weekly', 'weekdays', 'monday,wednesday,friday', etc.",
+    )
+    query_date: str | None = Field(
+        None, description="For queries: 'today', 'tomorrow', 'this_week', 'next_week', or YYYY-MM-DD"
+    )
+    modify_field: str | None = Field(None, description="For modifications: what to change ('time', 'title', 'duration')")
+    modify_value: str | None = Field(None, description="For modifications: the new value")
+    target_event: str | None = Field(None, description="For modify/delete: event name or description to find")
+    task_title: str | None = Field(None, description="For create_task: task name")
+    task_notes: str | None = Field(None, description="For create_task: task notes")
+    task_due: str | None = Field(None, description="For create_task: due date in YYYY-MM-DD")
+
+
 class CalendarModel(BaseModel):
     id: str = Field(..., description="ID of the calendar")
     summary: str = Field(..., description="Name of the calendar")

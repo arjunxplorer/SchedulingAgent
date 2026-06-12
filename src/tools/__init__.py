@@ -5,6 +5,16 @@ from .calendar_tools import (
     list_tasks,
     get_tasks,
     create_calendar_events,
-    clear_calendar_events
+    clear_calendar_events,
+    get_calendar_service,
+    get_tasks_service,
+    find_free_slots,
+    create_task,
+    delete_task,
+    suggest_alternative_times,
+    update_calendar_event,
+    search_events,
+    find_and_delete_event,
+    _set_web_context,
 )
 from .time_tools import get_current_time, get_date_in_iso_format, sum_to_date

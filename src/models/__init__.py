@@ -5,4 +5,5 @@ from .models import (
     TaskModel,
     CalendarEventList,
     TasksList,
+    UserIntent,
 )
